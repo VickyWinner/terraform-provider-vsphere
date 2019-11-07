@@ -221,6 +221,12 @@ func DiskSubresourceSchema() map[string]*schema.Schema {
 			Optional:    true,
 			Description: "The ID of the storage policy to assign to the virtual disk in VM.",
 		},
+		"ovf_mapping": {
+			Type:        schema.TypeString,
+			Optional:    true,
+			ForceNew:    true,
+			Description: "Mapping of disk to OVF datastore.",
+		},
 	}
 	structure.MergeSchema(s, subresourceSchema())
 	return s

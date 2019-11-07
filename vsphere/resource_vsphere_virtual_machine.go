@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/terraform-providers/terraform-provider-vsphere/vsphere/internal/helper/contentlibrary"
+	"github.com/vmware/govmomi/vapi/vcenter"
 	"log"
 	"net"
 	"strings"
@@ -848,7 +850,9 @@ func resourceVSphereVirtualMachineCustomizeDiff(d *schema.ResourceDiff, meta int
 			// flagging the imported flag to off.
 			d.SetNew("imported", false)
 		case d.Id() == "":
-			if err := vmworkflow.ValidateVirtualMachineClone(d, client); err != nil {
+			if contentlibrary.IsContentLibraryItem(meta.(*VSphereClient).restClient, d.Get("clone.0.template_uuid").(string)) {
+				// Do some content library checks
+			} else if err := vmworkflow.ValidateVirtualMachineClone(d, client); err != nil {
 				return err
 			}
 			fallthrough
@@ -1191,25 +1195,71 @@ func resourceVSphereVirtualMachineCreateClone(d *schema.ResourceData, meta inter
 		return nil, err
 	}
 
-	// Expand the clone spec. We get the source VM here too.
-	cloneSpec, srcVM, err := vmworkflow.ExpandVirtualMachineCloneSpec(d, client)
-	if err != nil {
-		return nil, err
-	}
-
 	// Start the clone
 	name := d.Get("name").(string)
 	timeout := d.Get("clone.0.timeout").(int)
 	var vm *object.VirtualMachine
-	if _, ok := d.GetOk("datastore_cluster_id"); ok {
-		vm, err = resourceVSphereVirtualMachineCreateCloneWithSDRS(d, meta, srcVM, fo, name, cloneSpec, timeout)
-	} else {
-		vm, err = virtualmachine.Clone(client, srcVM, fo, name, cloneSpec, timeout)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("error cloning virtual machine: %s", err)
-	}
+	if contentlibrary.IsContentLibraryItem(meta.(*VSphereClient).restClient, d.Get("clone.0.template_uuid").(string)) {
+		host := &object.HostSystem{}
+		if hid := d.Get("host_system_id").(string); hid != "" {
+			host, err = hostsystem.FromID(client, hid)
+			if err != nil {
+				return nil, err
+			}
+		}
+		sm := []vcenter.StorageMapping{}
+		disks := d.Get("disk").([]interface{})
+		log.Printf("BILLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL - %v", disks)
+		for _, di := range disks {
+			dm := di.(virtualdevice.DiskSubresource).Get("ovf_mapping").(string)
+			dd := di.(virtualdevice.DiskSubresource).Get("datastore_id").(string)
+			dp := di.(virtualdevice.DiskSubresource).Get("storage_policy_id").(string)
+			if dp == "" {
+				dp = d.Get("storage_policy_id").(string)
+			}
+			sm = append(sm, vcenter.StorageMapping{Key: dm, Value: vcenter.StorageGroupMapping{Type: "DATASTORE", DatastoreID: dd, StorageProfileID: dp}})
+		}
+		nm := []vcenter.NetworkMapping{}
+		nics := d.Get("network_interface").([]interface{})
+		for _, di := range nics {
+			dm := di.(virtualdevice.NetworkInterfaceSubresource).Get("ovf_mapping").(string)
+			dd := di.(virtualdevice.NetworkInterfaceSubresource).Get("network_id").(string)
+			dp := di.(virtualdevice.NetworkInterfaceSubresource).Get("storage_policy_id").(string)
+			if dp == "" {
+				dp = d.Get("storage_policy_id").(string)
+			}
+			nm = append(nm, vcenter.NetworkMapping{Key: dm, Value: dd})
+		}
 
+		dd := virtualmachine.DeployDest(name, "annotation", pool, host, fo, nm, sm)
+		rclient := meta.(VSphereClient).restClient
+		item, err := contentlibrary.ItemFromID(rclient, d.Get("clone.0.template_uuid").(string))
+		if err != nil {
+			return nil, err
+		}
+		vmoid, err := virtualmachine.Deploy(rclient, item, dd, 30)
+		if err != nil {
+			return nil, err
+		}
+		vm, err = virtualmachine.FromMOID(client, vmoid.String())
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// Expand the clone spec. We get the source VM here too.
+		cloneSpec, srcVM, err := vmworkflow.ExpandVirtualMachineCloneSpec(d, client)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := d.GetOk("datastore_cluster_id"); ok {
+			vm, err = resourceVSphereVirtualMachineCreateCloneWithSDRS(d, meta, srcVM, fo, name, cloneSpec, timeout)
+		} else {
+			vm, err = virtualmachine.Clone(client, srcVM, fo, name, cloneSpec, timeout)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("error cloning virtual machine: %s", err)
+		}
+	}
 	// The VM has been created. We still need to do post-clone configuration, and
 	// while the resource should have an ID until this is done, we need it to go
 	// through post-clone rollback workflows. All rollback functions will remove
